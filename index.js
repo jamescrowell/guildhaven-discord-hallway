@@ -163,3 +163,229 @@ async function discordFetch(url, options = {}) {
 
 async function exchangeCodeForToken(code) {
   const params = new URLSearchParams();
+  params.set('client_id', DISCORD_CLIENT_ID);
+  params.set('client_secret', DISCORD_CLIENT_SECRET);
+  params.set('grant_type', 'authorization_code');
+  params.set('code', code);
+  params.set('redirect_uri', DISCORD_REDIRECT_URI);
+
+  const token = await discordFetch('https://discord.com/api/oauth2/token', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: params
+  });
+
+  return token; // { access_token, token_type, expires_in, refresh_token, scope }
+}
+
+async function getDiscordUser(accessToken) {
+  return await discordFetch('https://discord.com/api/users/@me', {
+    headers: { Authorization: `Bearer ${accessToken}` }
+  });
+}
+
+async function addUserToGuild({ userId, accessToken }) {
+  // Requires OAuth scope: guilds.join
+  // Requires bot token with permissions to add members via API (it uses bot authorization)
+  return await discordFetch(`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${userId}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: `Bot ${DISCORD_BOT_TOKEN}`
+    },
+    body: JSON.stringify({ access_token: accessToken })
+  });
+}
+
+async function addRoleToMember({ userId, roleId }) {
+  return await discordFetch(
+    `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${userId}/roles/${roleId}`,
+    {
+      method: 'PUT',
+      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
+    }
+  );
+}
+
+async function removeRoleFromMember({ userId, roleId }) {
+  return await discordFetch(
+    `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${userId}/roles/${roleId}`,
+    {
+      method: 'DELETE',
+      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
+    }
+  );
+}
+
+async function postToZapier(payload) {
+  if (!ZAPIER_WEBHOOK_URL) return;
+  try {
+    await fetch(ZAPIER_WEBHOOK_URL, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  } catch (e) {
+    // Don't fail the whole auth flow if Zapier logging fails
+    console.warn('Zapier webhook failed:', e?.message || e);
+  }
+}
+
+// -------------------- ROUTES --------------------
+
+// Quick sanity route
+app.get('/health', (req, res) => res.json({ ok: true }));
+
+/**
+ * START ROUTE
+ * Example:
+ * /discord/start?tier=apprentice&email=test@email.com
+ */
+app.get('/discord/start', (req, res) => {
+  const tier = normalizeTier(req.query.tier);
+  const email = String(req.query.email || '').trim();
+
+  if (!tier || !ROLE_MAP[tier]) {
+    return res.status(400).send(page('Missing or invalid tier', 'Use a valid tier like <code>free</code>, <code>apprentice</code>, <code>journeyman</code>, <code>master</code>, <code>grandmaster</code>.'));
+  }
+
+  // email is optional but recommended for logging
+  // If you want to require it, uncomment:
+  // if (!email) return res.status(400).send(page('Missing email', 'You must include <code>email=</code> in the link.'));
+
+  // Prevent replay attacks: include timestamp + nonce
+  const statePayload = {
+    tier,
+    email,
+    ts: Date.now(),
+    nonce: crypto.randomBytes(16).toString('hex')
+  };
+
+  const state = signState(statePayload);
+
+  const auth = new URL('https://discord.com/api/oauth2/authorize');
+  auth.searchParams.set('client_id', DISCORD_CLIENT_ID);
+  auth.searchParams.set('redirect_uri', DISCORD_REDIRECT_URI);
+  auth.searchParams.set('response_type', 'code');
+  auth.searchParams.set('scope', 'identify guilds.join');
+  auth.searchParams.set('state', state);
+  auth.searchParams.set('prompt', 'consent');
+
+  // Send user to Discord
+  res.redirect(auth.toString());
+});
+
+/**
+ * CALLBACK ROUTE
+ * Discord redirects here after the user approves.
+ */
+app.get('/discord/callback', async (req, res) => {
+  const { code, state, error } = req.query;
+
+  if (error) {
+    return res.status(400).send(page('Discord authorization failed', `Discord returned error: <code>${String(error)}</code>`));
+  }
+
+  if (!code || !state) {
+    return res.status(400).send(page('Missing code/state', 'This callback is incomplete. Please try again from the email link.'));
+  }
+
+  const payload = verifyState(String(state));
+  if (!payload) {
+    return res.status(400).send(page('Invalid state', 'Security check failed (state signature invalid). Please restart from the email link.'));
+  }
+
+  // Optional expiration window for state (ex: 15 minutes)
+  const MAX_AGE_MS = 15 * 60 * 1000;
+  if (Date.now() - payload.ts > MAX_AGE_MS) {
+    return res.status(400).send(page('Link expired', 'This onboarding link expired. Please request a fresh one.'));
+  }
+
+  const tier = normalizeTier(payload.tier);
+  const email = payload.email || '';
+  const roleId = ROLE_MAP[tier];
+
+  if (!roleId) {
+    return res.status(400).send(page('Tier not configured', `No role configured for tier <code>${tier}</code>.`));
+  }
+
+  try {
+    // 1) code -> token
+    const token = await exchangeCodeForToken(String(code));
+    const accessToken = token.access_token;
+
+    // 2) identify the user
+    const user = await getDiscordUser(accessToken);
+    const discordUserId = user.id;
+    const discordUsername = user.username; // may not include discriminator in newer Discord
+
+    // 3) add to guild (server)
+    await addUserToGuild({ userId: discordUserId, accessToken });
+
+    // 4) remove other tier roles (optional but recommended)
+    // This prevents someone being "Master" and "Apprentice" at the same time.
+    for (const r of TIER_ROLES) {
+      if (r && r !== roleId) {
+        // ignore errors if they don't have the role
+        try {
+          await removeRoleFromMember({ userId: discordUserId, roleId: r });
+        } catch {}
+      }
+    }
+
+    // 5) add correct role
+    await addRoleToMember({ userId: discordUserId, roleId });
+
+    // 6) Zapier log (optional)
+    await postToZapier({
+      event: 'discord_onboarded',
+      email,
+      tier,
+      discordUserId,
+      discordUsername,
+      joinedAt: new Date().toISOString(),
+      source: 'oauth_hallway'
+    });
+
+    // 7) redirect or show success page
+    if (SUCCESS_REDIRECT_URL) {
+      const u = new URL(SUCCESS_REDIRECT_URL);
+      // Optional: pass info forward
+      u.searchParams.set('tier', tier);
+      u.searchParams.set('discord', discordUserId);
+      return res.redirect(u.toString());
+    }
+
+    return res.send(page('Welcome to GuildHaven ✅', `You are in! Discord user <code>${discordUsername}</code> was added and assigned tier <code>${tier}</code>. You can close this page.`));
+  } catch (e) {
+    console.error('Callback error:', e);
+
+    // Helpful debug info (safe-ish). Avoid leaking secrets.
+    const status = e?.status ? `Discord status: <code>${e.status}</code>. ` : '';
+    const hint =
+      e?.status === 401
+        ? '401 usually means your Bot Token is wrong.'
+        : e?.status === 403
+        ? '403 usually means the bot lacks permissions OR bot role is below the target role.'
+        : e?.status === 400
+        ? '400 can mean missing OAuth scope or invalid redirect uri/code.'
+        : 'Check Render logs for details.';
+
+    return res.status(500).send(page('Something went wrong', `${status}${hint}`));
+  }
+});
+
+// Root page
+app.get('/', (req, res) => {
+  res.send(
+    page(
+      'GuildHaven OAuth Hallway',
+      `Use <code>/discord/start?tier=apprentice&email=you@email.com</code> to begin.`
+    )
+  );
+});
+
+app.listen(PORT, () => {
+  console.log(`GuildHaven hallway running on port ${PORT}`);
+  console.log(`Base URL: ${BASE_URL}`);
+});
