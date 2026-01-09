@@ -1,101 +1,189 @@
+/**
+ * GuildHaven Discord Hallway
+ * - Receives Zapier webhook with { email }
+ * - Validates sync secret (header OR body)
+ * - Looks up member in Ghost Admin API by email
+ * - Returns JSON ALWAYS (200), even on errors, so Zapier doesn’t mask details
+ */
+
 import express from "express";
+import morgan from "morgan";
+import jwt from "jsonwebtoken";
 import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json());
 
+// ---- Middleware
+app.use(express.json({ limit: "1mb" }));
+app.use(morgan("combined"));
+
+// ---- ENV (expected)
 const {
-  SYNC_SECRET,
-  DISCORD_OAUTH_URL,          // e.g. https://guildhaven-discord-hallway.onrender.com/discord/auth
-  GHOST_ADMIN_API_URL,        // e.g. https://storytellers-guild.ghost.io/ghost/api/admin
-  GHOST_ADMIN_API_KEY         // Admin API key in "id:secret" format (Ghost Admin token string)
+  PORT = "10000",
+  GHOST_URL,                 // e.g. https://storytellers-guild.ghost.io
+  GHOST_ADMIN_API_KEY,       // Admin API key (not Content key)
+  GH_SYNC_SECRET,            // your shared secret
 } = process.env;
 
-function getIncomingSecret(req) {
-  return req.headers["x-sync-secret"] || req.body?.sync_secret || req.query?.sync_secret;
+function ok(res, payload) {
+  return res.status(200).json(payload);
 }
 
-function buildDiscordLink(email) {
-  // Keep it simple: your OAuth flow can use the email to resolve member + roles
-  const url = new URL(DISCORD_OAUTH_URL);
-  url.searchParams.set("email", email);
-  return url.toString();
+function getProvidedSecret(req) {
+  // Accept secret from either header or body (Zapier sometimes sends one or the other)
+  return (
+    req.header("x-sync-secret") ||
+    req.header("X-Sync-Secret") ||
+    req.body?.sync_secret ||
+    req.body?.x_sync_secret ||
+    req.body?.xSyncSecret ||
+    null
+  );
 }
 
-function stableTierSig({ status, labels }) {
-  // status: free/paid/comped/etc
-  // labels: array of label slugs (or empty)
-  const safeStatus = status || "unknown";
-  const safeLabels = Array.isArray(labels) ? labels.slice().sort() : [];
-  return `${safeStatus}|${safeLabels.join(",")}`;
+function safeEnvCheck() {
+  const missing = [];
+  if (!GHOST_URL) missing.push("GHOST_URL");
+  if (!GHOST_ADMIN_API_KEY) missing.push("GHOST_ADMIN_API_KEY");
+  if (!GH_SYNC_SECRET) missing.push("GH_SYNC_SECRET");
+  return missing;
 }
 
-async function findGhostMemberByEmail(email) {
-  // Returns { member, error } without throwing outward
-  try {
-    const endpoint = `${GHOST_ADMIN_API_URL}/members/?filter=email:${encodeURIComponent(email)}`;
-    const resp = await fetch(endpoint, {
-      headers: {
-        Authorization: `Ghost ${GHOST_ADMIN_API_KEY}`,
-        "Content-Type": "application/json"
-      }
-    });
-
-    const data = await resp.json().catch(() => ({}));
-    const member = data?.members?.[0] || null;
-
-    return { member, error: null };
-  } catch (err) {
-    return { member: null, error: err?.message || "ghost_lookup_failed" };
-  }
-}
-
-// IMPORTANT: this is the route your Zap is calling
-app.post("/ghost/resolve-tier", async (req, res) => {
-  const incoming = getIncomingSecret(req);
-  if (!incoming || incoming !== SYNC_SECRET) {
-    // Return 200 so Zap step doesn’t hard-fail (you can still inspect status)
-    return res.status(200).json({ ok: false, status: "unauthorized" });
+function makeGhostAdminToken(adminApiKey) {
+  // Ghost Admin API key format: "<id>:<secret>"
+  const [id, secret] = adminApiKey.split(":");
+  if (!id || !secret) {
+    throw new Error("GHOST_ADMIN_API_KEY must look like '<id>:<secret>'");
   }
 
-  const emailRaw = req.body?.email;
-  const email = typeof emailRaw === "string" ? emailRaw.trim().toLowerCase() : "";
+  const now = Math.floor(Date.now() / 1000);
+  const token = jwt.sign(
+    {
+      iat: now,
+      exp: now + 5 * 60,
+      aud: "/admin/",
+    },
+    Buffer.from(secret, "hex"),
+    {
+      keyid: id,
+      algorithm: "HS256",
+      header: { typ: "JWT" },
+    }
+  );
 
-  if (!email) {
-    // Again: never 4xx for Zap stability
-    return res.status(200).json({ ok: false, status: "missing_email" });
-  }
+  return token;
+}
 
-  const { member, error } = await findGhostMemberByEmail(email);
+async function ghostGetMemberByEmail(email) {
+  const token = makeGhostAdminToken(GHOST_ADMIN_API_KEY);
 
-  const status = member?.status || "unknown";
-  const labels = (member?.labels || []).map(l => l?.slug).filter(Boolean);
+  // Ghost Admin API: GET /ghost/api/admin/members/?filter=email:'...'
+  // We URL encode carefully and request related fields we may need
+  const filter = `email:'${email.replace(/'/g, "\\'")}'`;
+  const url =
+    `${GHOST_URL.replace(/\/$/, "")}` +
+    `/ghost/api/admin/members/?filter=${encodeURIComponent(filter)}&include=labels,subscriptions`;
 
-  const tierSig = stableTierSig({ status, labels });
-
-  // KEY IDEA:
-  // - If member exists, use member.id so a deleted/recreated account becomes a NEW key
-  // - Include tierSig so upgrades/downgrades become NEW keys (so you DO send another email)
-  const baseId = member?.id ? `mid:${member.id}` : `email:${email}`;
-  const storage_key = `guildhaven_sync_sent:${baseId}:${tierSig}`;
-
-  const discord_link = buildDiscordLink(email);
-
-  return res.status(200).json({
-    ok: true,
-    status: member ? "member_found" : "member_not_found",
-    email,
-    ghost_member_id: member?.id || null,
-    ghost_status: status,
-    ghost_labels: labels,
-    tier_sig: tierSig,
-    storage_key,
-    discord_link,
-    ghost_lookup_error: error || null
+  const resp = await fetch(url, {
+    method: "GET",
+    headers: {
+      Authorization: `Ghost ${token}`,
+      "Content-Type": "application/json",
+      Accept: "application/json",
+    },
   });
+
+  const text = await resp.text();
+  let data;
+  try {
+    data = JSON.parse(text);
+  } catch {
+    data = { raw: text };
+  }
+
+  return { status: resp.status, data };
+}
+
+// ---- Routes
+app.get("/health", (req, res) => {
+  const missing = safeEnvCheck();
+  if (missing.length) {
+    return ok(res, { ok: false, error: "Missing env vars", missing });
+  }
+  return ok(res, { ok: true });
 });
 
-app.get("/health", (_req, res) => res.status(200).send("ok"));
+// Use ONE endpoint name in Zapier. (Pick one and stick to it.)
+app.post("/ghost/resolve-tier", async (req, res) => {
+  const missing = safeEnvCheck();
+  if (missing.length) return ok(res, { ok: false, error: "Missing env vars", missing });
 
-const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server running on ${port}`));
+  const providedSecret = getProvidedSecret(req);
+  if (!providedSecret) {
+    return ok(res, {
+      ok: false,
+      error: "Missing sync secret",
+      hint: "Send header 'x-sync-secret' OR body field 'sync_secret'",
+    });
+  }
+  if (providedSecret !== GH_SYNC_SECRET) {
+    return ok(res, { ok: false, error: "Unauthorized (bad sync secret)" });
+  }
+
+  const email = req.body?.email;
+  if (!email || typeof email !== "string") {
+    return ok(res, {
+      ok: false,
+      error: "Missing email",
+      receivedBodyKeys: Object.keys(req.body || {}),
+      hint: "Send JSON body: { \"email\": \"person@example.com\" }",
+    });
+  }
+
+  try {
+    const { status, data } = await ghostGetMemberByEmail(email);
+
+    // Ghost returns members: [...]
+    const member = data?.members?.[0];
+
+    if (!member) {
+      return ok(res, {
+        ok: false,
+        error: "Member not found in Ghost",
+        ghostStatus: status,
+        ghostResponse: data,
+      });
+    }
+
+    // Determine a simple tier signal
+    const currentStatus = member.status || "unknown"; // often: "free" or "paid"
+    const labels = (member.labels || []).map(l => ({
+      id: l.id,
+      name: l.name,
+      slug: l.slug,
+    }));
+
+    // You can extend this mapping later (e.g. map label slug -> discord role)
+    return ok(res, {
+      ok: true,
+      email,
+      member: {
+        id: member.id,
+        status: currentStatus,
+        name: member.name,
+        labels,
+      },
+    });
+  } catch (err) {
+    return ok(res, {
+      ok: false,
+      error: "Server exception",
+      message: err?.message || String(err),
+    });
+  }
+});
+
+// ---- Start
+app.listen(Number(PORT), () => {
+  console.log(`GuildHaven hallway listening on port ${PORT}`);
+});
