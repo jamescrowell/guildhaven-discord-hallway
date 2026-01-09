@@ -1,27 +1,49 @@
 import fetch from "node-fetch";
 import express from "express";
 import jwt from "jsonwebtoken";
+import crypto from "crypto";
 
 const app = express();
 app.use(express.json());
 
 // -----------------------------
 // Auth helper (SYNC_SECRET)
+// - accepts x-sync-secret header OR sync_secret in query/body
+// - trims whitespace to prevent invisible mismatch
+// - logs safe fingerprints on auth fail
 // -----------------------------
 function requireSecret(req, res) {
-  const provided =
+  const rawProvided =
     req.get("x-sync-secret") ||
     req.query.sync_secret ||
     req.body?.sync_secret;
 
-  if (!process.env.SYNC_SECRET) {
+  const expected = String(process.env.SYNC_SECRET || "").trim();
+  const provided = String(rawProvided || "").trim();
+
+  if (!expected) {
     res.status(500).json({ error: "SYNC_SECRET not set on server" });
     return false;
   }
-  if (!provided || provided !== process.env.SYNC_SECRET) {
+
+  const fp = (s) =>
+    crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 12);
+
+  if (!provided || provided !== expected) {
+    console.log("[AUTH FAIL]", {
+      providedLen: provided.length,
+      expectedLen: expected.length,
+      providedFp: provided ? fp(provided) : null,
+      expectedFp: fp(expected),
+      hasHeader: !!req.get("x-sync-secret"),
+      hasQuery: !!req.query.sync_secret,
+      hasBody: !!req.body?.sync_secret
+    });
+
     res.status(401).json({ error: "Unauthorized" });
     return false;
   }
+
   return true;
 }
 
@@ -80,6 +102,7 @@ async function ghostAdminFetch(path) {
 function mapGhostTierNameToSlug(tierName) {
   const name = String(tierName || "").trim();
 
+  // These env vars should match Ghost tier names EXACTLY (case/spacing)
   const A = process.env.GHOST_TIER_NAME_APPRENTICE || "Apprentice";
   const J = process.env.GHOST_TIER_NAME_JOURNEYMAN || "Journeyman";
   const M = process.env.GHOST_TIER_NAME_MASTER || "Master";
@@ -121,12 +144,15 @@ function pickBestTierFromMember(member) {
 }
 
 // -----------------------------
-// Health check
+// Health
 // -----------------------------
 app.get("/health", (_req, res) => res.json({ ok: true }));
 
 // -----------------------------
-// NEW: Resolve tier from Ghost by email (key fix)
+// Resolve tier from Ghost by email
+// POST /ghost/resolve-tier
+// Body: { email: "user@example.com" }
+// Auth: x-sync-secret OR sync_secret
 // -----------------------------
 app.post("/ghost/resolve-tier", async (req, res) => {
   try {
@@ -149,7 +175,7 @@ app.post("/ghost/resolve-tier", async (req, res) => {
 
     const pick = pickBestTierFromMember(member);
 
-    // FREE is fully supported as fallback
+    // FREE supported as fallback
     const tier_slug = pick?.slug || "free";
 
     return res.json({
@@ -166,7 +192,8 @@ app.post("/ghost/resolve-tier", async (req, res) => {
 });
 
 // -----------------------------
-// /discord/start stub (keep or replace with your real OAuth start route)
+// Discord start (keeps your existing behavior)
+// /discord/start?tier=apprentice&email=user@example.com
 // -----------------------------
 app.get("/discord/start", (req, res) => {
   const tier = normalizeTierSlug(req.query?.tier);
@@ -175,15 +202,16 @@ app.get("/discord/start", (req, res) => {
   if (!tier || !email) {
     return res
       .status(400)
-      .send("Missing or invalid tier. Use: free, apprentice, journeyman, master, grandmaster");
+      .send("Missing or invalid tier. Use: free, apprentice, journeyman, master, grandmaster.");
   }
 
-  // If you already have Discord OAuth logic, put it here.
-  return res.status(200).send(`OK. Starting OAuth for ${email} with tier=${tier}`);
+  // If you already have your Discord OAuth redirect logic, it should run here.
+  // This stub just confirms tier+email are valid and stops the “Missing tier” error.
+  return res.status(200).send(`OK. OAuth start for ${email} (tier=${tier})`);
 });
 
 // -----------------------------
-// /discord/sync stub (keep or replace with your real sync route)
+// Sync endpoint placeholder (keep for compatibility)
 // -----------------------------
 app.post("/discord/sync", (req, res) => {
   if (!requireSecret(req, res)) return;
