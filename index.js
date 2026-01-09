@@ -1,213 +1,101 @@
 import express from "express";
-import jwt from "jsonwebtoken";
+import fetch from "node-fetch";
 
 const app = express();
-app.use(express.json({ limit: "1mb" }));
+app.use(express.json());
 
-/**
- * ===== REQUIRED ENV VARS =====
- * SYNC_SECRET        -> shared secret between Zapier and this service
- * GHOST_ADMIN_API_URL -> e.g. https://storytellers-guild.ghost.io
- * GHOST_ADMIN_API_KEY -> Ghost Admin API key (format: "{id}:{secret}")
- *
- * Optional:
- * PORT
- */
+const {
+  SYNC_SECRET,
+  DISCORD_OAUTH_URL,          // e.g. https://guildhaven-discord-hallway.onrender.com/discord/auth
+  GHOST_ADMIN_API_URL,        // e.g. https://storytellers-guild.ghost.io/ghost/api/admin
+  GHOST_ADMIN_API_KEY         // Admin API key in "id:secret" format (Ghost Admin token string)
+} = process.env;
 
-/**
- * Accept secret from multiple places to avoid Zapier header weirdness.
- */
-function requireSyncSecret(req, res, next) {
-  const expected = (process.env.SYNC_SECRET || "").trim();
-
-  const fromHeader =
-    req.get("x-sync-secret") ||
-    req.get("X-Sync-Secret") ||
-    req.get("x-sync_secret");
-
-  const provided =
-    (fromHeader || "").trim() ||
-    (req.body?.sync_secret || "").trim() ||
-    (req.query?.sync_secret || "").trim();
-
-  if (!expected) {
-    return res.status(500).json({ error: "Server missing SYNC_SECRET env var" });
-  }
-
-  if (!provided || provided !== expected) {
-    return res.status(401).json({
-      error: "Unauthorized",
-      hint: "Check SYNC_SECRET in Render + x-sync-secret header (or send sync_secret in body).",
-    });
-  }
-
-  next();
+function getIncomingSecret(req) {
+  return req.headers["x-sync-secret"] || req.body?.sync_secret || req.query?.sync_secret;
 }
 
-/**
- * Ghost Admin API auth token generator.
- * Ghost Admin API key format: "{id}:{secret}"
- * We sign a JWT using the secret and include the key id in the header (kid).
- */
-function makeGhostAdminToken() {
-  const apiKey = process.env.GHOST_ADMIN_API_KEY;
-  if (!apiKey || !apiKey.includes(":")) {
-    throw new Error(
-      "Missing/invalid GHOST_ADMIN_API_KEY. Expected format: {id}:{secret}"
-    );
-  }
-
-  const [id, secret] = apiKey.split(":");
-  const keySecret = Buffer.from(secret, "hex");
-
-  const now = Math.floor(Date.now() / 1000);
-  const token = jwt.sign(
-    {
-      iat: now,
-      exp: now + 5 * 60, // 5 minutes
-      aud: "/admin/",
-    },
-    keySecret,
-    {
-      algorithm: "HS256",
-      keyid: id,
-    }
-  );
-
-  return token;
+function buildDiscordLink(email) {
+  // Keep it simple: your OAuth flow can use the email to resolve member + roles
+  const url = new URL(DISCORD_OAUTH_URL);
+  url.searchParams.set("email", email);
+  return url.toString();
 }
 
-/**
- * Fetch a member by email from Ghost Admin API.
- * Uses /ghost/api/admin/members/?filter=email:'...'
- */
-async function fetchGhostMemberByEmail(email) {
-  const base = (process.env.GHOST_ADMIN_API_URL || "").replace(/\/$/, "");
-  if (!base) throw new Error("Missing GHOST_ADMIN_API_URL");
+function stableTierSig({ status, labels }) {
+  // status: free/paid/comped/etc
+  // labels: array of label slugs (or empty)
+  const safeStatus = status || "unknown";
+  const safeLabels = Array.isArray(labels) ? labels.slice().sort() : [];
+  return `${safeStatus}|${safeLabels.join(",")}`;
+}
 
-  const token = makeGhostAdminToken();
-
-  // Ghost filter syntax requires single quotes.
-  // Escape single quotes in email just in case.
-  const safeEmail = String(email).replace(/'/g, "\\'");
-  const url = `${base}/ghost/api/admin/members/?filter=email:'${encodeURIComponent(
-    safeEmail
-  )}'&include=tiers`;
-
-  const resp = await fetch(url, {
-    method: "GET",
-    headers: {
-      Authorization: `Ghost ${token}`,
-      "Content-Type": "application/json",
-      Accept: "application/json",
-    },
-  });
-
-  const text = await resp.text();
-  let data;
+async function findGhostMemberByEmail(email) {
+  // Returns { member, error } without throwing outward
   try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
-
-  if (!resp.ok) {
-    return {
-      ok: false,
-      status: resp.status,
-      error: "Ghost Admin API error",
-      details: data,
-    };
-  }
-
-  const member = data?.members?.[0];
-  if (!member) {
-    return {
-      ok: false,
-      status: 404,
-      error: "Member not found in Ghost",
-    };
-  }
-
-  // tiers may come back in different shapes depending on Ghost version.
-  // We normalize to a list of tier names if possible.
-  const tiersRaw =
-    member.tiers ||
-    member?.subscriptions?.[0]?.tier ||
-    member?.subscriptions?.map((s) => s?.tier) ||
-    [];
-
-  const tierNames = Array.isArray(tiersRaw)
-    ? tiersRaw.map((t) => t?.name).filter(Boolean)
-    : tiersRaw?.name
-    ? [tiersRaw.name]
-    : [];
-
-  return {
-    ok: true,
-    member: {
-      id: member.id,
-      uuid: member.uuid,
-      email: member.email,
-      name: member.name,
-      status: member.status, // "free" or "paid"
-      tier_names: tierNames, // could be []
-    },
-  };
-}
-
-/**
- * Health check
- */
-app.get("/health", (req, res) => {
-  res.json({ ok: true });
-});
-
-/**
- * Main Zapier endpoint:
- * POST /ghost/resolve-member
- *
- * Accepts:
- *  - body.email (recommended)
- *  - OR query.email
- *
- * Auth:
- *  - header x-sync-secret
- *  - OR body.sync_secret
- *  - OR query.sync_secret
- */
-app.post("/ghost/resolve-member", requireSyncSecret, async (req, res) => {
-  try {
-    const email = (req.body?.email || req.query?.email || "").trim();
-    if (!email) {
-      return res.status(400).json({
-        error: "Missing email",
-        hint: "Send JSON body like { \"email\": \"person@example.com\" }",
-      });
-    }
-
-    const result = await fetchGhostMemberByEmail(email);
-
-    if (!result.ok) {
-      return res.status(result.status || 500).json(result);
-    }
-
-    // This is what Zapier will use downstream
-    return res.json({
-      ok: true,
-      email: result.member.email,
-      status: result.member.status, // free/paid
-      tier_names: result.member.tier_names, // array of tier names
-      member_id: result.member.id,
-      member_uuid: result.member.uuid,
+    const endpoint = `${GHOST_ADMIN_API_URL}/members/?filter=email:${encodeURIComponent(email)}`;
+    const resp = await fetch(endpoint, {
+      headers: {
+        Authorization: `Ghost ${GHOST_ADMIN_API_KEY}`,
+        "Content-Type": "application/json"
+      }
     });
+
+    const data = await resp.json().catch(() => ({}));
+    const member = data?.members?.[0] || null;
+
+    return { member, error: null };
   } catch (err) {
-    return res.status(500).json({
-      error: "Server error",
-      message: err?.message || String(err),
-    });
+    return { member: null, error: err?.message || "ghost_lookup_failed" };
   }
+}
+
+// IMPORTANT: this is the route your Zap is calling
+app.post("/ghost/resolve-tier", async (req, res) => {
+  const incoming = getIncomingSecret(req);
+  if (!incoming || incoming !== SYNC_SECRET) {
+    // Return 200 so Zap step doesn’t hard-fail (you can still inspect status)
+    return res.status(200).json({ ok: false, status: "unauthorized" });
+  }
+
+  const emailRaw = req.body?.email;
+  const email = typeof emailRaw === "string" ? emailRaw.trim().toLowerCase() : "";
+
+  if (!email) {
+    // Again: never 4xx for Zap stability
+    return res.status(200).json({ ok: false, status: "missing_email" });
+  }
+
+  const { member, error } = await findGhostMemberByEmail(email);
+
+  const status = member?.status || "unknown";
+  const labels = (member?.labels || []).map(l => l?.slug).filter(Boolean);
+
+  const tierSig = stableTierSig({ status, labels });
+
+  // KEY IDEA:
+  // - If member exists, use member.id so a deleted/recreated account becomes a NEW key
+  // - Include tierSig so upgrades/downgrades become NEW keys (so you DO send another email)
+  const baseId = member?.id ? `mid:${member.id}` : `email:${email}`;
+  const storage_key = `guildhaven_sync_sent:${baseId}:${tierSig}`;
+
+  const discord_link = buildDiscordLink(email);
+
+  return res.status(200).json({
+    ok: true,
+    status: member ? "member_found" : "member_not_found",
+    email,
+    ghost_member_id: member?.id || null,
+    ghost_status: status,
+    ghost_labels: labels,
+    tier_sig: tierSig,
+    storage_key,
+    discord_link,
+    ghost_lookup_error: error || null
+  });
 });
+
+app.get("/health", (_req, res) => res.status(200).send("ok"));
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => console.log(`Server listening on ${port}`));
+app.listen(port, () => console.log(`Server running on ${port}`));
