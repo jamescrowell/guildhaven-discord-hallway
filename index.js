@@ -1,42 +1,12 @@
-/**
- * server.js — GuildHaven Discord Hallway (Render)
- *
- * Adds:
- *   POST /ghost/resolve-tier  -> returns tier_slug based on Ghost Admin API lookup by email
- *
- * Requires env vars:
- *   PORT
- *   SYNC_SECRET
- *
- *   DISCORD_CLIENT_ID
- *   DISCORD_CLIENT_SECRET
- *   DISCORD_REDIRECT_URI
- *   DISCORD_BOT_TOKEN
- *   DISCORD_GUILD_ID
- *   ROLE_ID_MEMBER (optional)
- *   ROLE_ID_APPRENTICE
- *   ROLE_ID_JOURNEYMAN
- *   ROLE_ID_MASTER
- *   ROLE_ID_GRANDMASTER
- *
- *   GHOST_ADMIN_API_URL          e.g. https://guildhaven.com
- *   GHOST_ADMIN_API_KEY          e.g. {id}:{secret}
- *
- *   GHOST_TIER_NAME_APPRENTICE   e.g. Apprentice
- *   GHOST_TIER_NAME_JOURNEYMAN   e.g. Journeyman
- *   GHOST_TIER_NAME_MASTER       e.g. Master
- *   GHOST_TIER_NAME_GRANDMASTER  e.g. Grandmaster
- */
-
+import fetch from "node-fetch";
 import express from "express";
-import crypto from "crypto";
 import jwt from "jsonwebtoken";
 
 const app = express();
 app.use(express.json());
 
 // -----------------------------
-// Helpers
+// Auth helper (SYNC_SECRET)
 // -----------------------------
 function requireSecret(req, res) {
   const provided =
@@ -61,6 +31,9 @@ function normalizeTierSlug(raw) {
   return allowed.has(v) ? v : null;
 }
 
+// -----------------------------
+// Ghost Admin API helpers
+// -----------------------------
 function buildGhostAdminJwt() {
   const key = process.env.GHOST_ADMIN_API_KEY;
   if (!key || !key.includes(":")) {
@@ -69,12 +42,7 @@ function buildGhostAdminJwt() {
   const [id, secret] = key.split(":");
   const signingKey = Buffer.from(secret, "hex");
 
-  // Ghost Admin API JWT requirements:
-  // - HS256
-  // - kid header = id
-  // - aud = /admin/
-  // - short expiry
-  const token = jwt.sign(
+  return jwt.sign(
     {},
     signingKey,
     {
@@ -84,7 +52,6 @@ function buildGhostAdminJwt() {
       audience: "/admin/"
     }
   );
-  return token;
 }
 
 async function ghostAdminFetch(path) {
@@ -122,33 +89,28 @@ function mapGhostTierNameToSlug(tierName) {
   if (name === J) return "journeyman";
   if (name === M) return "master";
   if (name === G) return "grandmaster";
-
   return null;
 }
 
 function pickBestTierFromMember(member) {
-  // Ghost member payloads can vary by version and fields returned.
-  // Common places:
-  // - member.tiers (array of tier objects)
-  // - member.subscriptions (array) each with tier / plan references
-  //
-  // We want the *currently active paid tier*. If multiple, pick first match.
+  // Prefer member.tiers if present
   const tiers = Array.isArray(member?.tiers) ? member.tiers : [];
   for (const t of tiers) {
     const slug = mapGhostTierNameToSlug(t?.name);
     if (slug) return { slug, source: "member.tiers", tierName: t?.name || "" };
   }
 
+  // Otherwise look at active subscriptions
   const subs = Array.isArray(member?.subscriptions) ? member.subscriptions : [];
-  // Look for an active subscription first
   const activeSubs = subs.filter(s => String(s?.status || "").toLowerCase() === "active");
+
   for (const s of activeSubs) {
     const tn = s?.tier?.name || s?.plan?.nickname || s?.plan?.name || "";
     const slug = mapGhostTierNameToSlug(tn);
     if (slug) return { slug, source: "member.subscriptions(active)", tierName: tn };
   }
 
-  // Fallback: any subscription tier-ish name
+  // Last resort: any subscription
   for (const s of subs) {
     const tn = s?.tier?.name || s?.plan?.nickname || s?.plan?.name || "";
     const slug = mapGhostTierNameToSlug(tn);
@@ -159,7 +121,12 @@ function pickBestTierFromMember(member) {
 }
 
 // -----------------------------
-// NEW endpoint: Resolve tier from Ghost by email
+// Health check
+// -----------------------------
+app.get("/health", (_req, res) => res.json({ ok: true }));
+
+// -----------------------------
+// NEW: Resolve tier from Ghost by email (key fix)
 // -----------------------------
 app.post("/ghost/resolve-tier", async (req, res) => {
   try {
@@ -168,8 +135,6 @@ app.post("/ghost/resolve-tier", async (req, res) => {
     const email = String(req.body?.email || "").trim();
     if (!email) return res.status(400).json({ error: "Missing email" });
 
-    // Filter by email in Ghost Admin API
-    // NOTE: filter syntax is sensitive; this is the standard approach.
     const filter = `email:'${email.replace(/'/g, "\\'")}'`;
     const encodedFilter = encodeURIComponent(filter);
 
@@ -183,13 +148,14 @@ app.post("/ghost/resolve-tier", async (req, res) => {
     }
 
     const pick = pickBestTierFromMember(member);
+
+    // FREE is fully supported as fallback
     const tier_slug = pick?.slug || "free";
 
     return res.json({
       email,
       tier_slug,
       debug: {
-        found: true,
         mapped_from: pick?.source || null,
         ghost_tier_name: pick?.tierName || null
       }
@@ -200,37 +166,29 @@ app.post("/ghost/resolve-tier", async (req, res) => {
 });
 
 // -----------------------------
-// Existing Hallway behavior (minimal stubs / placeholders)
-// NOTE: If you already have these routes, merge them—do not duplicate.
+// /discord/start stub (keep or replace with your real OAuth start route)
 // -----------------------------
-
-app.get("/health", (_req, res) => res.json({ ok: true }));
-
-// If your hallway already has /discord/start, keep yours.
-// This is a simple validation example.
 app.get("/discord/start", (req, res) => {
   const tier = normalizeTierSlug(req.query?.tier);
   const email = String(req.query?.email || "").trim();
 
   if (!tier || !email) {
-    return res.status(400).send(
-      `Missing or invalid tier. Must be one of: free, apprentice, journeyman, master, grandmaster`
-    );
+    return res
+      .status(400)
+      .send("Missing or invalid tier. Use: free, apprentice, journeyman, master, grandmaster");
   }
 
-  // Your existing OAuth redirect logic likely lives here.
-  // For now, just show confirmation so you can verify query params.
-  res.status(200).send(`OK. Starting OAuth for ${email} with tier=${tier}`);
+  // If you already have Discord OAuth logic, put it here.
+  return res.status(200).send(`OK. Starting OAuth for ${email} with tier=${tier}`);
 });
 
-// If you already have /discord/sync, keep yours.
-// Protected sync example:
+// -----------------------------
+// /discord/sync stub (keep or replace with your real sync route)
+// -----------------------------
 app.post("/discord/sync", (req, res) => {
   if (!requireSecret(req, res)) return;
-  res.json({ ok: true });
+  return res.json({ ok: true });
 });
 
 const port = process.env.PORT || 3000;
-app.listen(port, () => {
-  console.log(`Hallway server running on port ${port}`);
-});
+app.listen(port, () => console.log(`Hallway running on port ${port}`));
