@@ -1,189 +1,150 @@
-/**
- * GuildHaven Discord Hallway
- * - Receives Zapier webhook with { email }
- * - Validates sync secret (header OR body)
- * - Looks up member in Ghost Admin API by email
- * - Returns JSON ALWAYS (200), even on errors, so Zapier doesn’t mask details
- */
-
-import express from "express";
-import morgan from "morgan";
-import jwt from "jsonwebtoken";
-import fetch from "node-fetch";
+const express = require("express");
+const morgan = require("morgan");
+const jwt = require("jsonwebtoken");
+const fetch = require("node-fetch");
 
 const app = express();
-
-// ---- Middleware
 app.use(express.json({ limit: "1mb" }));
 app.use(morgan("combined"));
 
-// ---- ENV (expected)
 const {
   PORT = "10000",
-  GHOST_URL,                 // e.g. https://storytellers-guild.ghost.io
-  GHOST_ADMIN_API_KEY,       // Admin API key (not Content key)
-  GH_SYNC_SECRET,            // your shared secret
+  GHOST_ADMIN_API_URL,     // e.g. https://YOUR-SITE.ghost.io
+  GHOST_ADMIN_API_KEY,     // Ghost Admin API key: id:secret
+  SYNC_SECRET,
+  DISCORD_OAUTH_URL        // e.g. https://guildhaven-discord-hallway.onrender.com/discord/start
 } = process.env;
 
 function ok(res, payload) {
   return res.status(200).json(payload);
 }
 
-function getProvidedSecret(req) {
-  // Accept secret from either header or body (Zapier sometimes sends one or the other)
-  return (
-    req.header("x-sync-secret") ||
-    req.header("X-Sync-Secret") ||
-    req.body?.sync_secret ||
-    req.body?.x_sync_secret ||
-    req.body?.xSyncSecret ||
-    null
-  );
-}
-
-function safeEnvCheck() {
+function envCheck() {
   const missing = [];
-  if (!GHOST_URL) missing.push("GHOST_URL");
+  if (!GHOST_ADMIN_API_URL) missing.push("GHOST_ADMIN_API_URL");
   if (!GHOST_ADMIN_API_KEY) missing.push("GHOST_ADMIN_API_KEY");
-  if (!GH_SYNC_SECRET) missing.push("GH_SYNC_SECRET");
+  if (!SYNC_SECRET) missing.push("SYNC_SECRET");
+  if (!DISCORD_OAUTH_URL) missing.push("DISCORD_OAUTH_URL");
   return missing;
 }
 
-function makeGhostAdminToken(adminApiKey) {
-  // Ghost Admin API key format: "<id>:<secret>"
-  const [id, secret] = adminApiKey.split(":");
-  if (!id || !secret) {
-    throw new Error("GHOST_ADMIN_API_KEY must look like '<id>:<secret>'");
-  }
-
-  const now = Math.floor(Date.now() / 1000);
-  const token = jwt.sign(
-    {
-      iat: now,
-      exp: now + 5 * 60,
-      aud: "/admin/",
-    },
-    Buffer.from(secret, "hex"),
-    {
-      keyid: id,
-      algorithm: "HS256",
-      header: { typ: "JWT" },
-    }
-  );
-
-  return token;
+function getProvidedSecret(req) {
+  return (
+    req.get("x-sync-secret") ||
+    req.get("X-Sync-Secret") ||
+    (req.body && req.body.sync_secret) ||
+    (req.query && req.query.sync_secret) ||
+    ""
+  ).trim();
 }
 
-async function ghostGetMemberByEmail(email) {
-  const token = makeGhostAdminToken(GHOST_ADMIN_API_KEY);
+function makeGhostAdminToken() {
+  const apiKey = (GHOST_ADMIN_API_KEY || "").trim();
+  const parts = apiKey.split(":");
+  const id = parts[0];
+  const secret = parts[1];
+  if (!id || !secret) throw new Error("GHOST_ADMIN_API_KEY must be in format id:secret");
 
-  // Ghost Admin API: GET /ghost/api/admin/members/?filter=email:'...'
-  // We URL encode carefully and request related fields we may need
-  const filter = `email:'${email.replace(/'/g, "\\'")}'`;
-  const url =
-    `${GHOST_URL.replace(/\/$/, "")}` +
-    `/ghost/api/admin/members/?filter=${encodeURIComponent(filter)}&include=labels,subscriptions`;
+  const now = Math.floor(Date.now() / 1000);
+  return jwt.sign(
+    { iat: now, exp: now + 5 * 60, aud: "/admin/" },
+    Buffer.from(secret, "hex"),
+    { algorithm: "HS256", keyid: id }
+  );
+}
+
+async function ghostFindMemberByEmail(email) {
+  const base = GHOST_ADMIN_API_URL.replace(/\/$/, "");
+  const token = makeGhostAdminToken();
+
+  const filter = `email:'${String(email).replace(/'/g, "\\'")}'`;
+  const url = `${base}/ghost/api/admin/members/?filter=${encodeURIComponent(filter)}&include=labels,subscriptions,tiers`;
 
   const resp = await fetch(url, {
     method: "GET",
     headers: {
       Authorization: `Ghost ${token}`,
       "Content-Type": "application/json",
-      Accept: "application/json",
-    },
+      Accept: "application/json"
+    }
   });
 
   const text = await resp.text();
   let data;
-  try {
-    data = JSON.parse(text);
-  } catch {
-    data = { raw: text };
-  }
+  try { data = JSON.parse(text); } catch { data = { raw: text }; }
 
-  return { status: resp.status, data };
+  return { httpStatus: resp.status, data };
 }
 
-// ---- Routes
 app.get("/health", (req, res) => {
-  const missing = safeEnvCheck();
-  if (missing.length) {
-    return ok(res, { ok: false, error: "Missing env vars", missing });
-  }
+  const missing = envCheck();
+  if (missing.length) return ok(res, { ok: false, error: "Missing env vars", missing });
   return ok(res, { ok: true });
 });
 
-// Use ONE endpoint name in Zapier. (Pick one and stick to it.)
 app.post("/ghost/resolve-tier", async (req, res) => {
-  const missing = safeEnvCheck();
+  const missing = envCheck();
   if (missing.length) return ok(res, { ok: false, error: "Missing env vars", missing });
 
-  const providedSecret = getProvidedSecret(req);
-  if (!providedSecret) {
-    return ok(res, {
-      ok: false,
-      error: "Missing sync secret",
-      hint: "Send header 'x-sync-secret' OR body field 'sync_secret'",
-    });
-  }
-  if (providedSecret !== GH_SYNC_SECRET) {
-    return ok(res, { ok: false, error: "Unauthorized (bad sync secret)" });
-  }
+  const provided = getProvidedSecret(req);
+  if (!provided) return ok(res, { ok: false, error: "Missing sync secret" });
+  if (provided !== SYNC_SECRET) return ok(res, { ok: false, error: "Unauthorized (bad sync secret)" });
 
-  const email = req.body?.email;
-  if (!email || typeof email !== "string") {
+  const email = (req.body && req.body.email ? String(req.body.email) : "").trim().toLowerCase();
+  if (!email) {
     return ok(res, {
       ok: false,
       error: "Missing email",
-      receivedBodyKeys: Object.keys(req.body || {}),
-      hint: "Send JSON body: { \"email\": \"person@example.com\" }",
+      hint: "Send JSON body like {\"email\":\"person@example.com\"}"
     });
   }
 
+  console.log("[resolve-tier] email=", email);
+
+  let member = null;
+  let ghostError = null;
+  let ghostHttp = null;
   try {
-    const { status, data } = await ghostGetMemberByEmail(email);
-
-    // Ghost returns members: [...]
-    const member = data?.members?.[0];
-
-    if (!member) {
-      return ok(res, {
-        ok: false,
-        error: "Member not found in Ghost",
-        ghostStatus: status,
-        ghostResponse: data,
-      });
-    }
-
-    // Determine a simple tier signal
-    const currentStatus = member.status || "unknown"; // often: "free" or "paid"
-    const labels = (member.labels || []).map(l => ({
-      id: l.id,
-      name: l.name,
-      slug: l.slug,
-    }));
-
-    // You can extend this mapping later (e.g. map label slug -> discord role)
-    return ok(res, {
-      ok: true,
-      email,
-      member: {
-        id: member.id,
-        status: currentStatus,
-        name: member.name,
-        labels,
-      },
-    });
-  } catch (err) {
-    return ok(res, {
-      ok: false,
-      error: "Server exception",
-      message: err?.message || String(err),
-    });
+    const r = await ghostFindMemberByEmail(email);
+    ghostHttp = r.httpStatus;
+    member = r.data && r.data.members && r.data.members[0] ? r.data.members[0] : null;
+  } catch (e) {
+    ghostError = e.message || String(e);
   }
+
+  // IMPORTANT: member-not-found is NOT fatal for Zapier; we return ok:true anyway
+  const memberId = member && member.id ? member.id : null;
+  const status = member && member.status ? member.status : "unknown";
+
+  // Tier signature: use tiers if available, otherwise labels, otherwise status
+  const tierNames = Array.isArray(member && member.tiers) ? member.tiers.map(t => t && t.name).filter(Boolean) : [];
+  const labels = Array.isArray(member && member.labels) ? member.labels.map(l => l && l.slug).filter(Boolean) : [];
+
+  const tierSig = `${status}|tiers:${tierNames.slice().sort().join(",")}|labels:${labels.slice().sort().join(",")}`;
+
+  // This is what you will use for Storage dedupe (changes on tier changes; changes if member deleted/recreated)
+  const baseId = memberId ? `mid:${memberId}` : `email:${email}`;
+  const storage_key = `guildhaven_email_sent:${baseId}:${tierSig}`;
+
+  // Link you email out
+  const link = new URL(DISCORD_OAUTH_URL);
+  link.searchParams.set("email", email);
+
+  return ok(res, {
+    ok: true,
+    email,
+    member_found: !!member,
+    ghost_http: ghostHttp,
+    ghost_error: ghostError,
+    ghost_status: status,
+    tier_names: tierNames,
+    labels,
+    tier_sig: tierSig,
+    storage_key,
+    discord_link: link.toString()
+  });
 });
 
-// ---- Start
 app.listen(Number(PORT), () => {
-  console.log(`GuildHaven hallway listening on port ${PORT}`);
+  console.log(`Hallway listening on port ${PORT}`);
 });
