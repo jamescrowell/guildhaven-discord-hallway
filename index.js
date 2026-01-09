@@ -1,13 +1,15 @@
 /**
 * GuildHaven Discord Hallway (Render)
-* - Zapier -> POST /ghost/resolve-tier
-* - Generates:
-* - storage_key (32 chars, changes per membership event)
-* - discord_link (OAuth URL with state=storage_key)
+*
+* FIXES / FEATURES INCLUDED:
+* - Zapier -> POST /ghost/resolve-tier (DO NOT CHANGE PATH)
+* - Returns: storage_key (<=32 chars), discord_link
+* - storage_key changes on every membership event (uses Ghost updated_at/created_at)
 * - Discord OAuth callback:
-* - joins user to guild
-* - fetches Ghost member by Discord email
-* - assigns correct tier role (and removes other tier roles)
+* - exchanges code, gets user (with email scope)
+* - joins guild
+* - assigns the correct tier role (removes other tier roles)
+* - NEW: sends {discord_id,email,tier,...} to your Zapier Catch Hook for Google Sheets logging
 */
 
 const express = require("express");
@@ -30,7 +32,7 @@ PORT = 10000,
 GHOST_ADMIN_API_URL,
 GHOST_ADMIN_API_KEY,
 
-// Zap auth
+// Zap auth (your shared secret from Zap step 2 body)
 SYNC_SECRET,
 
 // Discord OAuth
@@ -45,19 +47,24 @@ ROLE_FREE,
 ROLE_APPRENTICE,
 ROLE_JOURNEYMAN,
 ROLE_MASTER,
-ROLE_GRANDMASTER
+ROLE_GRANDMASTER,
+
+// NEW (OPTIONAL but needed to log Discord ID -> Google Sheets via Zap)
+// Put your Zapier "Catch Hook" URL here
+OAUTH_LOG_WEBHOOK_URL,
+
+// OPTIONAL extra shared secret for the oauth logging zap (recommended)
+OAUTH_LOG_SECRET
 } = process.env;
 
 /* =====================
 BASIC VALIDATION
 ===================== */
 function requireEnv(name) {
-if (!process.env[name]) {
-throw new Error(`Missing required env var: ${name}`);
-}
+if (!process.env[name]) throw new Error(`Missing required env var: ${name}`);
 }
 
-// Hard requirements
+// Required for core flow
 requireEnv("GHOST_ADMIN_API_URL");
 requireEnv("GHOST_ADMIN_API_KEY");
 requireEnv("SYNC_SECRET");
@@ -117,7 +124,10 @@ json = { raw: text };
 }
 
 if (!res.ok) {
-const msg = json?.errors?.[0]?.message || json?.error || `Ghost admin error (${res.status})`;
+const msg =
+json?.errors?.[0]?.message ||
+json?.error ||
+`Ghost admin error (${res.status})`;
 throw new Error(msg);
 }
 
@@ -134,7 +144,7 @@ return json?.members?.[0] || null;
 
 /**
 * Determine a single “effective tier name” from Ghost member tiers.
-* If multiple tiers exist (rare), pick the first sorted by name.
+* If multiple tiers exist, pick the first sorted by name.
 */
 function getEffectiveTierName(member) {
 const tiers = Array.isArray(member?.tiers) ? member.tiers : [];
@@ -152,30 +162,30 @@ return merged.length ? merged.sort().join("|") : "none";
 
 /**
 * Map tier name -> Discord Role ID (env vars)
-* Adjust matching logic here if you rename tiers.
+* Matches by keyword so renamed tiers like "Journeyman 15% discount" still work.
 */
 function roleIdForTier(tierName) {
 const t = String(tierName || "").toLowerCase();
-
-// IMPORTANT: these match by keywords in the tier name.
-// So "Journeyman 15% discount" and "Journeyman" both still match.
 if (t.includes("grandmaster")) return ROLE_GRANDMASTER;
 if (t.includes("master")) return ROLE_MASTER;
 if (t.includes("journey")) return ROLE_JOURNEYMAN;
 if (t.includes("apprentice")) return ROLE_APPRENTICE;
-
-// default
 return ROLE_FREE;
 }
 
 /**
-* Remove all known tier roles from a user, then add the correct one.
+* Remove all known tier roles, then add the correct one.
 */
 async function setTierRoleForDiscordUser(discordUserId, roleIdToAdd) {
-const knownRoles = [ROLE_FREE, ROLE_APPRENTICE, ROLE_JOURNEYMAN, ROLE_MASTER, ROLE_GRANDMASTER]
-.filter(Boolean);
+const knownRoles = [
+ROLE_FREE,
+ROLE_APPRENTICE,
+ROLE_JOURNEYMAN,
+ROLE_MASTER,
+ROLE_GRANDMASTER
+].filter(Boolean);
 
-// Remove all known tier roles first (prevents stacking)
+// Remove all known tier roles first
 for (const rid of knownRoles) {
 await fetch(
 `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUserId}/roles/${rid}`,
@@ -203,6 +213,43 @@ throw new Error(`Failed to add role. Discord said ${addRes.status}: ${txt}`);
 }
 }
 
+/**
+* NEW: POST an event to Zapier (Catch Hook) so Sheets logging can run.
+* This is intentionally "non-fatal": if Zapier is down, we still consider Discord connect successful.
+*/
+async function postToZapierOAuthLog(payload) {
+if (!OAUTH_LOG_WEBHOOK_URL) return;
+
+// Optional shared secret check on the Zap side
+const body = {
+...payload,
+oauth_log_secret: OAUTH_LOG_SECRET || undefined
+};
+
+// short timeout so we don't hang the callback
+const controller = new AbortController();
+const timeout = setTimeout(() => controller.abort(), 7000);
+
+try {
+const res = await fetch(OAUTH_LOG_WEBHOOK_URL, {
+method: "POST",
+headers: { "Content-Type": "application/json" },
+body: JSON.stringify(body),
+signal: controller.signal
+});
+
+// If Zapier returns non-2xx, log it but don't break the user flow
+if (!res.ok) {
+const txt = await res.text().catch(() => "");
+console.warn("Zapier OAuth log webhook failed:", res.status, txt);
+}
+} catch (e) {
+console.warn("Zapier OAuth log webhook error:", String(e?.message || e));
+} finally {
+clearTimeout(timeout);
+}
+}
+
 /* =====================
 HEALTH CHECK
 ===================== */
@@ -219,29 +266,27 @@ return ok(res, { ok: false, error: "unauthorized" });
 }
 
 const email = String(req.body.email || "").toLowerCase().trim();
-const labelsFromZap = req.body.labels; // optional (your Zap has this)
+const labelsFromZap = req.body.labels; // optional
 
 if (!email) return ok(res, { ok: false, error: "missing email" });
 
 // Pull canonical state from Ghost (tiers + labels + updated_at)
 const member = await findGhostMemberByEmail(email);
 
-// If Ghost member not found, still return something stable
 const tierName = member ? getEffectiveTierName(member) : "unknown";
 const labelsSig = member ? getLabelsSignature(member, labelsFromZap) : (labelsFromZap || "none");
 
-// CRITICAL: eventStamp changes when membership changes (unsubscribe/resubscribe/upgrade/etc.)
+// CRITICAL: eventStamp changes when membership changes
 const eventStamp =
 member?.updated_at ||
 member?.created_at ||
 new Date().toISOString();
 
-// This is the ONLY thing that should drive the Zapier Storage key.
-// ALWAYS 32 chars.
+// Always 32 chars. THIS is what Zapier Storage Key must use.
 const storage_key = hash32(`${email}|${tierName}|${labelsSig}|${eventStamp}`);
 
-// Discord OAuth link goes into the email
-// IMPORTANT: include "email" scope so callback can map to Ghost member reliably
+// Discord OAuth link goes into the email.
+// IMPORTANT: include "email" scope so callback can map to Ghost member reliably.
 const discord_link =
 `https://discord.com/oauth2/authorize` +
 `?client_id=${DISCORD_CLIENT_ID}` +
@@ -255,8 +300,8 @@ ok: true,
 email,
 tier_sig: tierName,
 label_sig: labelsSig,
-storage_key, // <- THIS is what Step 3 must use as Key
-discord_link // <- THIS is what your email body should link to
+storage_key,
+discord_link
 });
 } catch (err) {
 return ok(res, {
@@ -272,6 +317,7 @@ DISCORD CALLBACK
 app.get("/discord/callback", async (req, res) => {
 try {
 const code = req.query.code;
+const state = String(req.query.state || "").trim(); // state == storage_key from resolve-tier
 if (!code) return res.status(400).send("Missing code");
 
 // Exchange code -> access token
@@ -298,9 +344,7 @@ headers: { Authorization: `Bearer ${tokenData.access_token}` }
 });
 const user = await userRes.json();
 
-if (!user?.id) {
-return res.status(400).send("Discord user lookup failed");
-}
+if (!user?.id) return res.status(400).send("Discord user lookup failed");
 
 // Join guild
 const joinRes = await fetch(
@@ -320,25 +364,36 @@ const txt = await joinRes.text().catch(() => "");
 return res.status(400).send(`Failed to join guild. Discord said ${joinRes.status}: ${txt}`);
 }
 
-// Assign tier role:
-// We map Discord email -> Ghost member -> tier -> role
 const discordEmail = String(user.email || "").toLowerCase().trim();
-
 if (!discordEmail) {
-// If email scope wasn’t granted, we can still join but cannot map tier safely.
 return res.send(`
 <h2>✅ Discord Connected</h2>
-<p>You successfully joined the server, but Discord did not provide your email.</p>
-<p>Please re-run the link and approve the <b>email</b> permission, or contact support.</p>
+<p>You joined the server, but Discord did not provide your email.</p>
+<p>Please re-run the link and approve the <b>email</b> permission.</p>
 `);
 }
 
+// Map Discord email -> Ghost member -> tier -> role
 const member = await findGhostMemberByEmail(discordEmail);
 const tierName = member ? getEffectiveTierName(member) : "free";
+const labelsSig = member ? getLabelsSignature(member, null) : "none";
 const roleId = roleIdForTier(tierName);
 
 // Apply role (remove other tier roles first)
 await setTierRoleForDiscordUser(user.id, roleId);
+
+// NEW: Send to Zapier so your Google Sheet can store email <-> discord_id
+// This is the missing piece for your “upgrade/downgrade/cancel” flows.
+postToZapierOAuthLog({
+event: "discord_oauth_connected",
+timestamp: new Date().toISOString(),
+guild_id: DISCORD_GUILD_ID,
+discord_id: String(user.id),
+email: discordEmail,
+tier: tierName,
+label_sig: labelsSig,
+storage_key: state || null
+});
 
 return res.send(`
 <h2>✅ Discord Connected</h2>
