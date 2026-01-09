@@ -1,3 +1,15 @@
+/**
+* GuildHaven Discord Hallway (Render)
+* - Zapier -> POST /ghost/resolve-tier
+* - Generates:
+* - storage_key (32 chars, changes per membership event)
+* - discord_link (OAuth URL with state=storage_key)
+* - Discord OAuth callback:
+* - joins user to guild
+* - fetches Ghost member by Discord email
+* - assigns correct tier role (and removes other tier roles)
+*/
+
 const express = require("express");
 const fetch = require("node-fetch");
 const crypto = require("crypto");
@@ -5,289 +17,342 @@ const jwt = require("jsonwebtoken");
 const morgan = require("morgan");
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: "1mb" }));
 app.use(morgan("combined"));
 
 /* =====================
-   ENV VARS (REQUIRED)
+ENV VARS (REQUIRED)
 ===================== */
 const {
-  PORT = 10000,
+PORT = 10000,
 
-  // Ghost
-  GHOST_ADMIN_API_URL,
-  GHOST_ADMIN_API_KEY,
+// Ghost Admin API
+GHOST_ADMIN_API_URL,
+GHOST_ADMIN_API_KEY,
 
-  // Sync secret shared with Zapier
-  SYNC_SECRET,
+// Zap auth
+SYNC_SECRET,
 
-  // Discord OAuth
-  DISCORD_CLIENT_ID,
-  DISCORD_CLIENT_SECRET,
-  DISCORD_REDIRECT_URI,
-  DISCORD_BOT_TOKEN,
-  DISCORD_GUILD_ID,
+// Discord OAuth
+DISCORD_CLIENT_ID,
+DISCORD_CLIENT_SECRET,
+DISCORD_REDIRECT_URI, // must be https://<your-domain>/discord/callback
+DISCORD_BOT_TOKEN,
+DISCORD_GUILD_ID,
 
-  // Used to safely pass email through OAuth "state"
-  STATE_SECRET,
-
-  // Discord role IDs (must match your server role IDs)
-  ROLE_FREE,
-  ROLE_APPRENTICE,
-  ROLE_JOURNEYMAN,
-  ROLE_MASTER,
-  ROLE_GRANDMASTER
+// Discord Role IDs (strings)
+ROLE_FREE,
+ROLE_APPRENTICE,
+ROLE_JOURNEYMAN,
+ROLE_MASTER,
+ROLE_GRANDMASTER
 } = process.env;
 
 /* =====================
-   HELPERS
+BASIC VALIDATION
+===================== */
+function requireEnv(name) {
+if (!process.env[name]) {
+throw new Error(`Missing required env var: ${name}`);
+}
+}
+
+// Hard requirements
+requireEnv("GHOST_ADMIN_API_URL");
+requireEnv("GHOST_ADMIN_API_KEY");
+requireEnv("SYNC_SECRET");
+requireEnv("DISCORD_CLIENT_ID");
+requireEnv("DISCORD_CLIENT_SECRET");
+requireEnv("DISCORD_REDIRECT_URI");
+requireEnv("DISCORD_BOT_TOKEN");
+requireEnv("DISCORD_GUILD_ID");
+
+/* =====================
+HELPERS
 ===================== */
 function ok(res, data) {
-  return res.status(200).json(data);
+return res.status(200).json(data);
 }
 
 function hash32(input) {
-  return crypto.createHash("sha256").update(input).digest("hex").slice(0, 32);
+return crypto.createHash("sha256").update(String(input)).digest("hex").slice(0, 32);
+}
+
+function normalizeCsvList(str) {
+if (!str) return [];
+return String(str)
+.split(",")
+.map(s => s.trim())
+.filter(Boolean);
 }
 
 function ghostAdminToken() {
-  const [id, secret] = GHOST_ADMIN_API_KEY.split(":");
-  return jwt.sign(
-    {
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + 300,
-      aud: "/admin/"
-    },
-    Buffer.from(secret, "hex"),
-    { algorithm: "HS256", keyid: id }
-  );
+const [id, secret] = String(GHOST_ADMIN_API_KEY).split(":");
+return jwt.sign(
+{
+iat: Math.floor(Date.now() / 1000),
+exp: Math.floor(Date.now() / 1000) + 300,
+aud: "/admin/"
+},
+Buffer.from(secret, "hex"),
+{ algorithm: "HS256", keyid: id }
+);
 }
 
-async function findGhostMember(email) {
-  const token = ghostAdminToken();
-  const url =
-    `${GHOST_ADMIN_API_URL.replace(/\/$/, "")}` +
-    `/ghost/api/admin/members/?filter=email:'${email}'&include=tiers,labels`;
+async function ghostAdminFetch(path) {
+const token = ghostAdminToken();
+const base = String(GHOST_ADMIN_API_URL).replace(/\/$/, "");
+const url = `${base}${path.startsWith("/") ? "" : "/"}${path}`;
 
-  const res = await fetch(url, {
-    headers: { Authorization: `Ghost ${token}` }
-  });
+const res = await fetch(url, {
+headers: { Authorization: `Ghost ${token}` }
+});
 
-  const json = await res.json();
-  return json.members?.[0] || null;
+const text = await res.text();
+let json;
+try {
+json = JSON.parse(text);
+} catch {
+json = { raw: text };
 }
 
-// Prefer highest tier if multiple
-function pickTierName(member) {
-  const tiers = (member?.tiers || []).map(t => t.name);
-  if (!tiers.length) return null;
-
-  // If you ever have multiple tiers, decide priority here:
-  const priority = ["Grandmaster", "Master", "Journeyman", "Apprentice", "Free"];
-  tiers.sort((a, b) => priority.indexOf(a) - priority.indexOf(b));
-  return tiers[0];
+if (!res.ok) {
+const msg = json?.errors?.[0]?.message || json?.error || `Ghost admin error (${res.status})`;
+throw new Error(msg);
 }
 
+return json;
+}
+
+async function findGhostMemberByEmail(email) {
+const safeEmail = String(email).replace(/'/g, "\\'");
+const json = await ghostAdminFetch(
+`/ghost/api/admin/members/?filter=email:'${safeEmail}'&include=tiers,labels`
+);
+return json?.members?.[0] || null;
+}
+
+/**
+* Determine a single “effective tier name” from Ghost member tiers.
+* If multiple tiers exist (rare), pick the first sorted by name.
+*/
+function getEffectiveTierName(member) {
+const tiers = Array.isArray(member?.tiers) ? member.tiers : [];
+if (!tiers.length) return "free";
+const names = tiers.map(t => t?.name).filter(Boolean).sort();
+return names[0] || "free";
+}
+
+function getLabelsSignature(member, labelsFromZap) {
+const ghostLabels = Array.isArray(member?.labels) ? member.labels : [];
+const names = ghostLabels.map(l => l?.name).filter(Boolean);
+const merged = names.length ? names : normalizeCsvList(labelsFromZap);
+return merged.length ? merged.sort().join("|") : "none";
+}
+
+/**
+* Map tier name -> Discord Role ID (env vars)
+* Adjust matching logic here if you rename tiers.
+*/
 function roleIdForTier(tierName) {
-  if (!tierName) return null;
-  const name = tierName.toLowerCase();
+const t = String(tierName || "").toLowerCase();
 
-  if (name.includes("grandmaster")) return ROLE_GRANDMASTER;
-  if (name.includes("master")) return ROLE_MASTER;
-  if (name.includes("journey")) return ROLE_JOURNEYMAN;
-  if (name.includes("apprentice")) return ROLE_APPRENTICE;
-  if (name.includes("free")) return ROLE_FREE;
+// IMPORTANT: these match by keywords in the tier name.
+// So "Journeyman 15% discount" and "Journeyman" both still match.
+if (t.includes("grandmaster")) return ROLE_GRANDMASTER;
+if (t.includes("master")) return ROLE_MASTER;
+if (t.includes("journey")) return ROLE_JOURNEYMAN;
+if (t.includes("apprentice")) return ROLE_APPRENTICE;
 
-  // If tier names differ, add more mappings here
-  return null;
+// default
+return ROLE_FREE;
 }
 
-async function addRole(discordUserId, roleId) {
-  if (!roleId) return;
+/**
+* Remove all known tier roles from a user, then add the correct one.
+*/
+async function setTierRoleForDiscordUser(discordUserId, roleIdToAdd) {
+const knownRoles = [ROLE_FREE, ROLE_APPRENTICE, ROLE_JOURNEYMAN, ROLE_MASTER, ROLE_GRANDMASTER]
+.filter(Boolean);
 
-  await fetch(
-    `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUserId}/roles/${roleId}`,
-    {
-      method: "PUT",
-      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
-    }
-  );
+// Remove all known tier roles first (prevents stacking)
+for (const rid of knownRoles) {
+await fetch(
+`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUserId}/roles/${rid}`,
+{
+method: "DELETE",
+headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
+}
+);
 }
 
-async function removeRole(discordUserId, roleId) {
-  if (!roleId) return;
-
-  await fetch(
-    `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUserId}/roles/${roleId}`,
-    {
-      method: "DELETE",
-      headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
-    }
-  );
+// Add the correct role
+if (roleIdToAdd) {
+const addRes = await fetch(
+`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${discordUserId}/roles/${roleIdToAdd}`,
+{
+method: "PUT",
+headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` }
 }
+);
 
-async function syncRoles(discordUserId, desiredRoleId) {
-  // Remove all known tier roles, then add the desired one
-  const allRoles = [
-    ROLE_FREE,
-    ROLE_APPRENTICE,
-    ROLE_JOURNEYMAN,
-    ROLE_MASTER,
-    ROLE_GRANDMASTER
-  ].filter(Boolean);
-
-  for (const r of allRoles) {
-    if (r !== desiredRoleId) await removeRole(discordUserId, r);
-  }
-  await addRole(discordUserId, desiredRoleId);
+if (!addRes.ok) {
+const txt = await addRes.text().catch(() => "");
+throw new Error(`Failed to add role. Discord said ${addRes.status}: ${txt}`);
+}
+}
 }
 
 /* =====================
-   HEALTH CHECK
+HEALTH CHECK
 ===================== */
 app.get("/health", (req, res) => ok(res, { ok: true }));
 
 /* =====================
-   ZAPIER ENTRY POINT
-   (You said keep /ghost/resolve-tier)
+ZAPIER ENTRY POINT
+(DO NOT CHANGE PATH)
 ===================== */
 app.post("/ghost/resolve-tier", async (req, res) => {
-  if (req.body.sync_secret !== SYNC_SECRET) {
-    return ok(res, { ok: false, error: "unauthorized" });
-  }
+try {
+if (req.body.sync_secret !== SYNC_SECRET) {
+return ok(res, { ok: false, error: "unauthorized" });
+}
 
-  const email = String(req.body.email || "").toLowerCase().trim();
-  if (!email) return ok(res, { ok: false, error: "missing email" });
+const email = String(req.body.email || "").toLowerCase().trim();
+const labelsFromZap = req.body.labels; // optional (your Zap has this)
 
-  const member = await findGhostMember(email);
+if (!email) return ok(res, { ok: false, error: "missing email" });
 
-  const tierNames = member?.tiers?.map(t => t.name).sort().join("|") || "none";
-  const labelNames = member?.labels?.map(l => l.name).sort().join("|") || "none";
+// Pull canonical state from Ghost (tiers + labels + updated_at)
+const member = await findGhostMemberByEmail(email);
 
-  // This is ONLY for Zap Storage (must be ≤ 32 chars)
-  const storage_key = hash32(`${email}:${tierNames}:${labelNames}`);
+// If Ghost member not found, still return something stable
+const tierName = member ? getEffectiveTierName(member) : "unknown";
+const labelsSig = member ? getLabelsSignature(member, labelsFromZap) : (labelsFromZap || "none");
 
-  // IMPORTANT: We also pass email safely through OAuth state via JWT.
-  // This is what allows the callback to fetch Ghost + assign role.
-  const state_token = jwt.sign(
-    { email, storage_key },
-    STATE_SECRET,
-    { algorithm: "HS256", expiresIn: "30m" }
-  );
+// CRITICAL: eventStamp changes when membership changes (unsubscribe/resubscribe/upgrade/etc.)
+const eventStamp =
+member?.updated_at ||
+member?.created_at ||
+new Date().toISOString();
 
-  // Discord OAuth link (THIS is what goes in the email)
-  const discord_link =
-    `https://discord.com/oauth2/authorize` +
-    `?client_id=${DISCORD_CLIENT_ID}` +
-    `&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}` +
-    `&response_type=code` +
-    `&scope=identify%20guilds.join` +
-    `&state=${encodeURIComponent(state_token)}`;
+// This is the ONLY thing that should drive the Zapier Storage key.
+// ALWAYS 32 chars.
+const storage_key = hash32(`${email}|${tierName}|${labelsSig}|${eventStamp}`);
 
-  ok(res, {
-    ok: true,
-    email,
-    storage_key,
-    tier_sig: tierNames === "none" ? "none" : hash32(tierNames),
-    label_sig: labelNames === "none" ? "none" : hash32(labelNames),
-    discord_link
-  });
+// Discord OAuth link goes into the email
+// IMPORTANT: include "email" scope so callback can map to Ghost member reliably
+const discord_link =
+`https://discord.com/oauth2/authorize` +
+`?client_id=${DISCORD_CLIENT_ID}` +
+`&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}` +
+`&response_type=code` +
+`&scope=${encodeURIComponent("identify email guilds.join")}` +
+`&state=${encodeURIComponent(storage_key)}`;
+
+return ok(res, {
+ok: true,
+email,
+tier_sig: tierName,
+label_sig: labelsSig,
+storage_key, // <- THIS is what Step 3 must use as Key
+discord_link // <- THIS is what your email body should link to
+});
+} catch (err) {
+return ok(res, {
+ok: false,
+error: String(err?.message || err || "unknown error")
+});
+}
 });
 
 /* =====================
-   DISCORD CALLBACK
-   - joins user
-   - looks up Ghost tier (by email in state token)
-   - assigns correct role
+DISCORD CALLBACK
 ===================== */
 app.get("/discord/callback", async (req, res) => {
-  try {
-    const code = req.query.code;
-    const state = req.query.state;
-    if (!code) return res.status(400).send("Missing code");
-    if (!state) return res.status(400).send("Missing state");
+try {
+const code = req.query.code;
+if (!code) return res.status(400).send("Missing code");
 
-    // Verify + decode state token
-    let decoded;
-    try {
-      decoded = jwt.verify(state, STATE_SECRET, { algorithms: ["HS256"] });
-    } catch (e) {
-      return res.status(400).send("Invalid/expired state token. Please request a new Discord link.");
-    }
+// Exchange code -> access token
+const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
+method: "POST",
+headers: { "Content-Type": "application/x-www-form-urlencoded" },
+body: new URLSearchParams({
+client_id: DISCORD_CLIENT_ID,
+client_secret: DISCORD_CLIENT_SECRET,
+grant_type: "authorization_code",
+code: String(code),
+redirect_uri: DISCORD_REDIRECT_URI
+})
+});
 
-    const email = String(decoded.email || "").toLowerCase().trim();
-    if (!email) return res.status(400).send("State token missing email.");
+const tokenData = await tokenRes.json();
+if (!tokenData?.access_token) {
+return res.status(400).send("Discord auth failed (no access token)");
+}
 
-    // Exchange code for token
-    const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
-      method: "POST",
-      headers: { "Content-Type": "application/x-www-form-urlencoded" },
-      body: new URLSearchParams({
-        client_id: DISCORD_CLIENT_ID,
-        client_secret: DISCORD_CLIENT_SECRET,
-        grant_type: "authorization_code",
-        code,
-        redirect_uri: DISCORD_REDIRECT_URI
-      })
-    });
+// Get Discord user (includes email ONLY if scope includes "email")
+const userRes = await fetch("https://discord.com/api/users/@me", {
+headers: { Authorization: `Bearer ${tokenData.access_token}` }
+});
+const user = await userRes.json();
 
-    const tokenData = await tokenRes.json();
-    if (!tokenData.access_token) {
-      return res.status(400).send("Discord auth failed");
-    }
+if (!user?.id) {
+return res.status(400).send("Discord user lookup failed");
+}
 
-    // Get Discord user
-    const userRes = await fetch("https://discord.com/api/users/@me", {
-      headers: { Authorization: `Bearer ${tokenData.access_token}` }
-    });
-    const user = await userRes.json();
-    if (!user?.id) return res.status(400).send("Could not read Discord user.");
+// Join guild
+const joinRes = await fetch(
+`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}`,
+{
+method: "PUT",
+headers: {
+Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+"Content-Type": "application/json"
+},
+body: JSON.stringify({ access_token: tokenData.access_token })
+}
+);
 
-    // Add to guild
-    await fetch(
-      `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ access_token: tokenData.access_token })
-      }
-    );
+if (!joinRes.ok) {
+const txt = await joinRes.text().catch(() => "");
+return res.status(400).send(`Failed to join guild. Discord said ${joinRes.status}: ${txt}`);
+}
 
-    // Fetch Ghost member NOW (authoritative), decide tier role, assign
-    const member = await findGhostMember(email);
-    const tierName = pickTierName(member);
-    const desiredRoleId = roleIdForTier(tierName);
+// Assign tier role:
+// We map Discord email -> Ghost member -> tier -> role
+const discordEmail = String(user.email || "").toLowerCase().trim();
 
-    if (!desiredRoleId) {
-      // If you want, you can default to ROLE_FREE here:
-      // desiredRoleId = ROLE_FREE;
-      return res.send(
-        `<h2>✅ Discord Connected</h2>
-         <p>We added you to the server, but couldn’t match your tier to a Discord role.</p>
-         <p>Tier detected: <b>${tierName || "none"}</b></p>`
-      );
-    }
+if (!discordEmail) {
+// If email scope wasn’t granted, we can still join but cannot map tier safely.
+return res.send(`
+<h2>✅ Discord Connected</h2>
+<p>You successfully joined the server, but Discord did not provide your email.</p>
+<p>Please re-run the link and approve the <b>email</b> permission, or contact support.</p>
+`);
+}
 
-    await syncRoles(user.id, desiredRoleId);
+const member = await findGhostMemberByEmail(discordEmail);
+const tierName = member ? getEffectiveTierName(member) : "free";
+const roleId = roleIdForTier(tierName);
 
-    return res.send(
-      `<h2>✅ Discord Connected</h2>
-       <p>You’ve been added and your membership role has been applied.</p>
-       <p>Tier detected: <b>${tierName}</b></p>
-       <p>You can now return to Discord.</p>`
-    );
-  } catch (err) {
-    console.error("Discord callback error:", err);
-    return res.status(500).send("Server error during Discord callback.");
-  }
+// Apply role (remove other tier roles first)
+await setTierRoleForDiscordUser(user.id, roleId);
+
+return res.send(`
+<h2>✅ Discord Connected</h2>
+<p>You're in! Your membership role has been applied.</p>
+<p>You can now return to Discord.</p>
+`);
+} catch (err) {
+return res.status(500).send(`Server error: ${String(err?.message || err)}`);
+}
 });
 
 /* =====================
-   START SERVER
+START SERVER
 ===================== */
 app.listen(PORT, () => {
-  console.log(`🚀 GuildHaven Hallway running on ${PORT}`);
+console.log(`🚀 GuildHaven Hallway running on ${PORT}`);
 });
