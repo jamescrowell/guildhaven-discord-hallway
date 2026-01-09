@@ -24,9 +24,19 @@ const {
   // Discord OAuth + Bot
   DISCORD_CLIENT_ID,
   DISCORD_CLIENT_SECRET,
-  DISCORD_REDIRECT_URI, // must match Discord Developer Portal redirect URI exactly
+  DISCORD_REDIRECT_URI, // must be .../discord/callback
   DISCORD_BOT_TOKEN,
-  DISCORD_GUILD_ID
+  DISCORD_GUILD_ID,
+
+  // Tier role IDs (YOUR NAMES)
+  ROLE_FREE,
+  ROLE_APPRENTICE,
+  ROLE_JOURNEYMAN,
+  ROLE_MASTER,
+  ROLE_GRANDMASTER,
+
+  // State signing secret (use what you already set)
+  STATE_SECRET
 } = process.env;
 
 /* =====================
@@ -36,23 +46,20 @@ function ok(res, data) {
   return res.status(200).json(data);
 }
 
-function hash32(input) {
-  // ALWAYS returns 32 chars (safe for Zapier Storage key limit)
-  return crypto.createHash("sha256").update(String(input)).digest("hex").slice(0, 32);
-}
-
 function requireEnv(name) {
   if (!process.env[name] || !String(process.env[name]).trim()) {
     throw new Error(`Missing env var: ${name}`);
   }
 }
 
+function hash32(input) {
+  return crypto.createHash("sha256").update(String(input)).digest("hex").slice(0, 32);
+}
+
 function ghostAdminToken() {
-  requireEnv("GHOST_ADMIN_API_KEY");
-  const parts = String(GHOST_ADMIN_API_KEY).trim().split(":");
-  const id = parts[0];
-  const secret = parts[1];
-  if (!id || !secret) throw new Error("GHOST_ADMIN_API_KEY must be in format id:secret");
+  const apiKey = (GHOST_ADMIN_API_KEY || "").trim();
+  const [id, secret] = apiKey.split(":");
+  if (!id || !secret) throw new Error("GHOST_ADMIN_API_KEY must be id:secret");
 
   const now = Math.floor(Date.now() / 1000);
   return jwt.sign(
@@ -63,143 +70,163 @@ function ghostAdminToken() {
 }
 
 async function findGhostMemberByEmail(email) {
-  requireEnv("GHOST_ADMIN_API_URL");
-
-  const base = String(GHOST_ADMIN_API_URL).replace(/\/$/, "");
+  const base = (GHOST_ADMIN_API_URL || "").replace(/\/$/, "");
   const token = ghostAdminToken();
 
-  // include subscriptions so re-subscribe later can generate a NEW key
   const filter = `email:'${String(email).replace(/'/g, "\\'")}'`;
   const url =
-    `${base}/ghost/api/admin/members/` +
-    `?filter=${encodeURIComponent(filter)}` +
+    `${base}/ghost/api/admin/members/?filter=${encodeURIComponent(filter)}` +
     `&include=tiers,labels,subscriptions`;
 
   const resp = await fetch(url, {
     method: "GET",
     headers: {
       Authorization: `Ghost ${token}`,
-      Accept: "application/json"
+      Accept: "application/json",
+      "Content-Type": "application/json"
     }
   });
 
   const text = await resp.text();
-  let json;
-  try { json = JSON.parse(text); } catch { json = null; }
+  let data;
+  try { data = JSON.parse(text); } catch { data = {}; }
 
-  if (!resp.ok) {
-    throw new Error(`Ghost error ${resp.status}: ${text.slice(0, 200)}`);
-  }
-
-  return (json && json.members && json.members[0]) ? json.members[0] : null;
+  return (data.members && data.members[0]) ? data.members[0] : null;
 }
 
-function newestSubscriptionFingerprint(member) {
-  // Goal: if someone cancels and later re-subscribes, Ghost usually creates a new subscription
-  // We use newest subscription id (or created_at). If none, fallback to member.updated_at.
-  const subs = Array.isArray(member?.subscriptions) ? member.subscriptions : [];
-  const sorted = subs.slice().sort((a, b) =>
-    String(b?.created_at || "").localeCompare(String(a?.created_at || ""))
-  );
+function signState(payload) {
+  const secret = (STATE_SECRET || "").trim();
+  if (!secret) throw new Error("STATE_SECRET missing");
+  return jwt.sign(payload, secret, { expiresIn: "20m" });
+}
 
-  const newest = sorted[0];
-  const subId = newest?.id || "";
-  const subCreated = newest?.created_at || "";
-  const updated = member?.updated_at || "";
+function verifyState(state) {
+  const secret = (STATE_SECRET || "").trim();
+  if (!secret) throw new Error("STATE_SECRET missing");
+  return jwt.verify(state, secret);
+}
 
-  return subId || subCreated || updated || "none";
+// Normalize tier names for matching
+function normalize(s) {
+  return String(s || "").trim().toLowerCase();
+}
+
+/**
+ * Map Ghost tier -> Discord role id (using YOUR env vars)
+ * Adjust the keyword checks if your tier names differ.
+ */
+function roleIdForMember(member) {
+  const tierNames = Array.isArray(member?.tiers)
+    ? member.tiers.map(t => t?.name).filter(Boolean)
+    : [];
+
+  const tiers = tierNames.map(normalize);
+
+  // Example keyword matching:
+  // If your Ghost tier names are EXACT like "Apprentice", "Journeyman", etc,
+  // these will match perfectly.
+  if (tiers.some(t => t.includes("grandmaster"))) return ROLE_GRANDMASTER;
+  if (tiers.some(t => t.includes("master"))) return ROLE_MASTER;
+  if (tiers.some(t => t.includes("journeyman"))) return ROLE_JOURNEYMAN;
+  if (tiers.some(t => t.includes("apprentice"))) return ROLE_APPRENTICE;
+
+  // Optional: If you want free members to still get a role:
+  if (ROLE_FREE) return ROLE_FREE;
+
+  return null;
+}
+
+function allTierRoleIds() {
+  // we remove these before adding the correct one
+  return [ROLE_FREE, ROLE_APPRENTICE, ROLE_JOURNEYMAN, ROLE_MASTER, ROLE_GRANDMASTER]
+    .map(v => String(v || "").trim())
+    .filter(Boolean);
 }
 
 /* =====================
    HEALTH
 ===================== */
 app.get("/health", (req, res) => {
-  const required = [
-    "GHOST_ADMIN_API_URL",
-    "GHOST_ADMIN_API_KEY",
-    "SYNC_SECRET",
-    "DISCORD_CLIENT_ID",
-    "DISCORD_CLIENT_SECRET",
-    "DISCORD_REDIRECT_URI",
-    "DISCORD_BOT_TOKEN",
-    "DISCORD_GUILD_ID"
-  ];
-  const missing = required.filter(k => !process.env[k] || !String(process.env[k]).trim());
-  return ok(res, { ok: missing.length === 0, missing });
-});
-
-/* =====================
-   ZAPIER ENTRY POINT
-   KEEP THIS ROUTE NAME:
-   /ghost/resolve-tier
-===================== */
-app.post("/ghost/resolve-tier", async (req, res) => {
   try {
-    // Auth: allow header OR body (so you can keep your Zapier setup flexible)
-    const provided =
-      String(req.get("x-sync-secret") || req.get("X-Sync-Secret") || "").trim() ||
-      String(req.body?.sync_secret || "").trim();
-
-    if (!provided) return ok(res, { ok: false, error: "missing sync_secret" });
-    if (provided !== String(SYNC_SECRET || "").trim()) return ok(res, { ok: false, error: "unauthorized" });
-
-    const email = String(req.body?.email || "").toLowerCase().trim();
-    if (!email) return ok(res, { ok: false, error: "missing email" });
-
-    const member = await findGhostMemberByEmail(email);
-
-    const tierNames = Array.isArray(member?.tiers)
-      ? member.tiers.map(t => t?.name).filter(Boolean).sort().join("|")
-      : "none";
-
-    const memberId = member?.id || "no_member_id";
-    const reSubFp = member ? newestSubscriptionFingerprint(member) : "none";
-
-    // ✅ This is the ONLY key you should use in Zapier Storage.
-    // It is ALWAYS 32 chars max.
-    // It changes when: tier changes OR a new subscription is created later (re-subscribe).
-    const storage_key = hash32(`${email}|${memberId}|${tierNames}|${reSubFp}`);
-
-    // ✅ This is the link you should put in the email (or select from webhook output).
-    requireEnv("DISCORD_CLIENT_ID");
-    requireEnv("DISCORD_REDIRECT_URI");
-
-    const discord_link =
-      `https://discord.com/oauth2/authorize` +
-      `?client_id=${encodeURIComponent(DISCORD_CLIENT_ID)}` +
-      `&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}` +
-      `&response_type=code` +
-      `&scope=identify%20guilds.join` +
-      `&state=${encodeURIComponent(storage_key)}`;
-
-    return ok(res, {
-      ok: true,
-      email,
-      member_found: !!member,
-      tier_names: tierNames,
-      storage_key,   // 👈 USE THIS IN STORAGE (<=32)
-      discord_link   // 👈 USE THIS IN EMAIL BODY
-    });
-  } catch (e) {
-    return ok(res, { ok: false, error: String(e?.message || e) });
-  }
-});
-
-/* =====================
-   DISCORD CALLBACK (MUST EXIST)
-===================== */
-app.get("/discord/callback", async (req, res) => {
-  try {
+    // only check essentials (don’t block health if optional role envs missing)
+    requireEnv("GHOST_ADMIN_API_URL");
+    requireEnv("GHOST_ADMIN_API_KEY");
+    requireEnv("SYNC_SECRET");
     requireEnv("DISCORD_CLIENT_ID");
     requireEnv("DISCORD_CLIENT_SECRET");
     requireEnv("DISCORD_REDIRECT_URI");
     requireEnv("DISCORD_BOT_TOKEN");
     requireEnv("DISCORD_GUILD_ID");
+    requireEnv("STATE_SECRET");
+    return ok(res, { ok: true });
+  } catch (e) {
+    return ok(res, { ok: false, error: e.message });
+  }
+});
 
-    const code = String(req.query?.code || "").trim();
+/* =====================
+   ZAPIER ENTRY POINT
+   KEEP THIS ROUTE NAME
+===================== */
+app.post("/ghost/resolve-tier", async (req, res) => {
+  try {
+    const provided = String(req.body?.sync_secret || "").trim();
+    if (!provided) return ok(res, { ok: false, error: "Missing sync_secret" });
+    if (provided !== String(SYNC_SECRET || "").trim()) return ok(res, { ok: false, error: "Unauthorized" });
+
+    const email = String(req.body?.email || "").trim().toLowerCase();
+    if (!email) return ok(res, { ok: false, error: "Missing email" });
+
+    const member = await findGhostMemberByEmail(email);
+
+    const tierNames = Array.isArray(member?.tiers) ? member.tiers.map(t => t?.name).filter(Boolean) : [];
+    const tierSig = tierNames.slice().sort().join("|") || "none";
+
+    // ✅ Simple, Zapier-safe storage key (<=32 chars)
+    const storage_key = hash32(`${email}|${tierSig}`);
+
+    // Signed state carries the email so callback can re-check Ghost and assign roles
+    const state = signState({ email });
+
+    // ✅ THIS is the link you put in the email (from Webhook step output)
+    const discord_link =
+      `https://discord.com/oauth2/authorize` +
+      `?client_id=${encodeURIComponent(DISCORD_CLIENT_ID)}` +
+      `&redirect_uri=${encodeURIComponent(DISCORD_REDIRECT_URI)}` +
+      `&response_type=code` +
+      `&scope=${encodeURIComponent("identify guilds.join")}` +
+      `&state=${encodeURIComponent(state)}`;
+
+    return ok(res, {
+      ok: true,
+      email,
+      tier_names: tierNames,
+      storage_key,
+      discord_link
+    });
+  } catch (e) {
+    return ok(res, { ok: false, error: e.message || String(e) });
+  }
+});
+
+/* =====================
+   DISCORD CALLBACK
+   MUST MATCH REDIRECT URI
+===================== */
+app.get("/discord/callback", async (req, res) => {
+  try {
+    const code = String(req.query.code || "");
+    const state = String(req.query.state || "");
+
     if (!code) return res.status(400).send("Missing code");
+    if (!state) return res.status(400).send("Missing state");
 
-    // Exchange code for token
+    // 1) Decode email from state
+    const decoded = verifyState(state);
+    const email = String(decoded?.email || "").trim().toLowerCase();
+    if (!email) return res.status(400).send("Invalid state (no email)");
+
+    // 2) Exchange code -> access token
     const tokenRes = await fetch("https://discord.com/api/oauth2/token", {
       method: "POST",
       headers: { "Content-Type": "application/x-www-form-urlencoded" },
@@ -214,40 +241,59 @@ app.get("/discord/callback", async (req, res) => {
 
     const tokenData = await tokenRes.json();
     if (!tokenData?.access_token) {
-      return res.status(400).send("Discord auth failed (no access_token).");
+      return res.status(400).send("Discord token exchange failed");
     }
 
-    // Get Discord user
+    // 3) Get Discord user
     const userRes = await fetch("https://discord.com/api/users/@me", {
       headers: { Authorization: `Bearer ${tokenData.access_token}` }
     });
     const user = await userRes.json();
-    if (!user?.id) return res.status(400).send("Discord user lookup failed.");
+    if (!user?.id) return res.status(400).send("Could not read Discord user");
 
-    // Add to guild
-    const addRes = await fetch(
-      `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}`,
-      {
-        method: "PUT",
-        headers: {
-          Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({ access_token: tokenData.access_token })
-      }
-    );
+    // 4) Add/update member in guild (guilds.join)
+    await fetch(`https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}`, {
+      method: "PUT",
+      headers: {
+        Authorization: `Bot ${DISCORD_BOT_TOKEN}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ access_token: tokenData.access_token })
+    });
 
-    if (!addRes.ok) {
-      const t = await addRes.text();
-      return res.status(400).send(`Failed to add to server: ${t.slice(0, 300)}`);
+    // 5) Look up Ghost again to get authoritative tier
+    const member = await findGhostMemberByEmail(email);
+
+    // 6) Compute correct role id
+    const targetRoleId = roleIdForMember(member);
+
+    // 7) Remove other tier roles first (prevents stacking after upgrades/downgrades)
+    const tierRoles = allTierRoleIds();
+    for (const rid of tierRoles) {
+      // skip removing the role we will add back
+      if (targetRoleId && rid === String(targetRoleId).trim()) continue;
+
+      // DELETE role from member (ignore failures)
+      await fetch(
+        `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}/roles/${rid}`,
+        { method: "DELETE", headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+      ).catch(() => {});
+    }
+
+    // 8) Add the correct tier role (if we found one)
+    if (targetRoleId) {
+      await fetch(
+        `https://discord.com/api/guilds/${DISCORD_GUILD_ID}/members/${user.id}/roles/${targetRoleId}`,
+        { method: "PUT", headers: { Authorization: `Bot ${DISCORD_BOT_TOKEN}` } }
+      );
     }
 
     return res.send(`
       <h2>✅ Discord Connected</h2>
-      <p>You can close this tab and return to Discord.</p>
+      <p>You're in. You can return to Discord now.</p>
     `);
   } catch (e) {
-    return res.status(400).send(`Callback error: ${String(e?.message || e)}`);
+    return res.status(500).send(`Callback error: ${e.message || String(e)}`);
   }
 });
 
